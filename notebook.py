@@ -4096,7 +4096,6 @@ def gradient_illustration(PIRATE_BLUE, PIRATE_ORANGE):
     _gradient_illustration()
     return
 
-
 @app.cell(hide_code=True)
 def gradient_steering_helpers(
     DEVICE,
@@ -4158,6 +4157,78 @@ def gradient_steering_helpers(
             float(pred_mu.item()),
             float(sigma_hat.item()),
         )
+
+    def steered_grad_at_last_pos(
+        bundle, steer_layer, measure_layer, ids, last_pos, steering_vector=None
+    ):
+        """Exact sigma-gradient at `measure_layer` while steering at `steer_layer`.
+
+        The forward pass applies the steering vector at the last comma position of
+        `steer_layer`, captures the residual stream at `measure_layer` at the same
+        position, and backprops sigma_hat through the actual steered trajectory.
+        Returns (position, gradient, pred_mu, pred_sigma).
+        """
+        steer_module = (
+            bundle.model.model.embed_tokens
+            if steer_layer == 0
+            else bundle.model.model.layers[steer_layer - 1]
+        )
+        measure_module = (
+            bundle.model.model.embed_tokens
+            if measure_layer == 0
+            else bundle.model.model.layers[measure_layer - 1]
+        )
+        vec = (
+            None
+            if steering_vector is None
+            else torch.as_tensor(steering_vector, dtype=torch.float16, device=DEVICE)
+        )
+        captured = {}
+
+        def _steer_hook(_module, _inputs, output):
+            hs = output[0] if isinstance(output, tuple) else output
+            hs = hs.clone()
+            if vec is not None:
+                hs[:, last_pos, :] = hs[:, last_pos, :] + vec
+            if isinstance(output, tuple):
+                return (hs,) + output[1:]
+            return hs
+
+        def _measure_hook(_module, _inputs, output):
+            hs = output[0] if isinstance(output, tuple) else output
+            hs = hs.clone()
+            hs.requires_grad_(True)
+            captured["resid"] = hs
+            if isinstance(output, tuple):
+                return (hs,) + output[1:]
+            return hs
+
+        steer_handle = steer_module.register_forward_hook(_steer_hook)
+        measure_handle = measure_module.register_forward_hook(_measure_hook)
+        try:
+            out = bundle.model(input_ids=ids)
+        finally:
+            steer_handle.remove()
+            measure_handle.remove()
+
+        logits = out.logits[0, last_pos].float()
+        probs = torch.softmax(logits, dim=-1)
+        int_probs = probs.index_select(-1, bundle.int_token_ids)
+        int_probs = int_probs / int_probs.sum()
+        values = torch.arange(SUPPORT, device=DEVICE, dtype=torch.float32)
+        pred_mu = (values * int_probs).sum()
+        pred_var = (int_probs * (values - pred_mu) ** 2).sum()
+        sigma_hat = torch.sqrt(pred_var)
+
+        resid = captured["resid"]
+        (grad,) = torch.autograd.grad(sigma_hat, resid)
+        return (
+            resid[0, last_pos].detach().cpu().float().numpy(),
+            grad[0, last_pos].detach().cpu().float().numpy(),
+            float(pred_mu.item()),
+            float(sigma_hat.item()),
+        )
+
 
     def gradient_discovery_trajectory(
         layer,
@@ -4228,7 +4299,8 @@ def gradient_steering_helpers(
         positions.append(accumulated.copy())
         return rows, positions
 
-    return (gradient_discovery_trajectory,)
+    return gradient_discovery_trajectory, steered_grad_at_last_pos
+
 
 
 @app.cell(hide_code=True)
