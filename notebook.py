@@ -1777,7 +1777,7 @@ def digit_probes_puzzle():
 
 @app.cell(hide_code=True)
 def helix_probe_display():
-    HelixProbe(=True, autoplay=False, js="remote")
+    HelixProbe(is_3d=True, autoplay=False, js="remote")
     return
 
 
