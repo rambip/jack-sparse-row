@@ -1778,7 +1778,7 @@ def digit_probes_puzzle():
 
 @app.cell(hide_code=True)
 def helix_probe_display():
-    HelixProbe(is_3d=True, autoplay=False, js="remote")
+    HelixProbe(=True, autoplay=False, js="remote")
     return
 
 
@@ -2437,7 +2437,7 @@ class ManifoldWorld(ManimWidget):
 
 @app.cell
 def manifold_world_display():
-    ManifoldWorld(is_3d=True, autoplay=False, canvas_width=900. js="remote")
+    ManifoldWorld(is_3d=True, autoplay=False, canvas_width=900, js="remote")
     return
 
 
