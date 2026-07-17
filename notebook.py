@@ -25,7 +25,7 @@
 
 import marimo
 
-__generated_with = "0.23.9"
+__generated_with = "0.23.14"
 app = marimo.App(
     width="medium",
     css_file="/usr/local/_marimo/custom.css",
@@ -3778,17 +3778,23 @@ def steering_variant_helpers(
 
 @app.cell(hide_code=True)
 def steering_variant_data(
+    DEVICE,
     activation_groups,
+    bundle,
     chord_direction_at,
     collect_variable_direction_steering_curve,
     experiment_config,
+    group_prompts,
     piecewise_direction_at,
     pooled_centroids,
     spline_direction_at,
     steer_max_alpha,
     steer_mu,
+    steered_grad_at_last_pos,
     steering_layer,
+    tokenize,
 ):
+
     _mu_classes = sorted(experiment_config.mu_values)
     _centroids = pooled_centroids(
         _mu_classes, activation_groups, steering_layer
@@ -3823,7 +3829,192 @@ def steering_variant_data(
         experiment_config,
         mu_max=700.0,
     )
-    return chord_steering_df, piecewise_steering_df, spline_steering_df
+
+    @mo.persistent_cache
+    def _collect_spline_steering_trace():
+        path_sigma = 50.0
+        prompt = group_prompts(
+            steer_mu,
+            path_sigma,
+            experiment_config.n_numbers,
+            1,
+            experiment_config.seed,
+        )[0]
+        ids = tokenize(bundle, [prompt]).to(DEVICE)
+        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][
+            -1
+        ]
+        target_mu = float(max(_mu_classes))
+        trace_alphas = np.linspace(0.0, steer_max_alpha, 21)
+        alpha_values = []
+        positions = []
+        gradients = []
+        pred_mus = []
+        pred_sigmas = []
+
+        for alpha in mo.status.progress_bar(
+            trace_alphas, title="Tracing actual spline steering"
+        ):
+            steering_vector = spline_direction_at(
+                _mu_classes,
+                _centroids,
+                steer_mu,
+                steer_mu + alpha,
+                _bandwidth,
+            )
+            position, gradient, pred_mu, pred_sigma = steered_grad_at_last_pos(
+                bundle,
+                steering_layer,
+                steering_layer + 1,
+                ids,
+                last_pos,
+                steering_vector=steering_vector,
+            )
+            alpha_values.append(alpha)
+            positions.append(position)
+            gradients.append(gradient)
+            pred_mus.append(pred_mu)
+            pred_sigmas.append(pred_sigma)
+            if pred_mu >= target_mu:
+                break
+
+        return {
+            "alpha": np.array(alpha_values, dtype=np.float64),
+            "position": np.stack(positions),
+            "gradient": np.stack(gradients),
+            "pred_mu": np.array(pred_mus, dtype=np.float64),
+            "pred_sigma": np.array(pred_sigmas, dtype=np.float64),
+            "sigma": path_sigma,
+            "mu": steer_mu,
+        }
+
+    spline_steering_trace = _collect_spline_steering_trace()
+
+    @mo.persistent_cache
+    def _collect_piecewise_steering_trace():
+        path_sigma = 50.0
+        prompt = group_prompts(
+            steer_mu,
+            path_sigma,
+            experiment_config.n_numbers,
+            1,
+            experiment_config.seed,
+        )[0]
+        ids = tokenize(bundle, [prompt]).to(DEVICE)
+        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][
+            -1
+        ]
+        target_mu = float(max(_mu_classes))
+        trace_alphas = np.linspace(0.0, steer_max_alpha, 21)
+        alpha_values = []
+        positions = []
+        gradients = []
+        pred_mus = []
+        pred_sigmas = []
+
+        for alpha in mo.status.progress_bar(
+            trace_alphas, title="Tracing actual piecewise steering"
+        ):
+            steering_vector = piecewise_direction_at(
+                _mu_classes,
+                _centroids,
+                steer_mu,
+                steer_mu + alpha,
+            )
+            position, gradient, pred_mu, pred_sigma = steered_grad_at_last_pos(
+                bundle,
+                steering_layer,
+                steering_layer + 1,
+                ids,
+                last_pos,
+                steering_vector=steering_vector,
+            )
+            alpha_values.append(alpha)
+            positions.append(position)
+            gradients.append(gradient)
+            pred_mus.append(pred_mu)
+            pred_sigmas.append(pred_sigma)
+            if pred_mu >= target_mu:
+                break
+
+        return {
+            "alpha": np.array(alpha_values, dtype=np.float64),
+            "position": np.stack(positions),
+            "gradient": np.stack(gradients),
+            "pred_mu": np.array(pred_mus, dtype=np.float64),
+            "pred_sigma": np.array(pred_sigmas, dtype=np.float64),
+            "sigma": path_sigma,
+            "mu": steer_mu,
+        }
+
+    piecewise_steering_trace = _collect_piecewise_steering_trace()
+
+    @mo.persistent_cache
+    def _collect_straight_steering_trace():
+        path_sigma = 50.0
+        prompt = group_prompts(
+            steer_mu,
+            path_sigma,
+            experiment_config.n_numbers,
+            1,
+            experiment_config.seed,
+        )[0]
+        ids = tokenize(bundle, [prompt]).to(DEVICE)
+        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][
+            -1
+        ]
+        target_mu = float(max(_mu_classes))
+        trace_alphas = np.linspace(0.0, steer_max_alpha, 21)
+        alpha_values = []
+        positions = []
+        gradients = []
+        pred_mus = []
+        pred_sigmas = []
+
+        for alpha in mo.status.progress_bar(
+            trace_alphas, title="Tracing actual straight steering"
+        ):
+            steering_vector = chord_direction_at(
+                _mu_classes,
+                _centroids,
+                steer_mu,
+                steer_mu + alpha,
+            )
+            position, gradient, pred_mu, pred_sigma = steered_grad_at_last_pos(
+                bundle,
+                steering_layer,
+                steering_layer + 1,
+                ids,
+                last_pos,
+                steering_vector=steering_vector,
+            )
+            alpha_values.append(alpha)
+            positions.append(position)
+            gradients.append(gradient)
+            pred_mus.append(pred_mu)
+            pred_sigmas.append(pred_sigma)
+            if pred_mu >= target_mu:
+                break
+
+        return {
+            "alpha": np.array(alpha_values, dtype=np.float64),
+            "position": np.stack(positions),
+            "gradient": np.stack(gradients),
+            "pred_mu": np.array(pred_mus, dtype=np.float64),
+            "pred_sigma": np.array(pred_sigmas, dtype=np.float64),
+            "sigma": path_sigma,
+            "mu": steer_mu,
+        }
+
+    straight_steering_trace = _collect_straight_steering_trace()
+
+    return (
+        chord_steering_df,
+        piecewise_steering_df,
+        piecewise_steering_trace,
+        spline_steering_df,
+        straight_steering_trace,
+    )
 
 
 @app.cell
@@ -4096,6 +4287,7 @@ def gradient_illustration(PIRATE_BLUE, PIRATE_ORANGE):
     _gradient_illustration()
     return
 
+
 @app.cell(hide_code=True)
 def gradient_steering_helpers(
     DEVICE,
@@ -4300,7 +4492,6 @@ def gradient_steering_helpers(
         return rows, positions
 
     return gradient_discovery_trajectory, steered_grad_at_last_pos
-
 
 
 @app.cell(hide_code=True)
@@ -5086,6 +5277,7 @@ def geo_monument_globe_plot(
     )
     geo_monument_map
     return
+
 
 @app.cell(hide_code=True)
 def additional_material_title():
