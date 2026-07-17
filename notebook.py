@@ -618,11 +618,10 @@ def jack_intro(jack, md_character_break, md_text_start):
 def model_selector():
     model_selector = mo.ui.dropdown(
         [
-            "meta-llama/Llama-3.2-1B",
-            "meta-llama/Llama-3.2-3B",
-            "meta-llama/Llama-3.1-8B",
+            "unsloth/Llama-3.2-1B",
+            "unsloth/Llama-3.2-3B",
         ],
-        value="meta-llama/Llama-3.2-1B",
+        value="unsloth/Llama-3.2-1B",
         label="Model",
     )
     model_selector
