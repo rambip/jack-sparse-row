@@ -8,7 +8,7 @@
 #     "leafmap==0.63.0",
 #     "manim==0.20.1",
 #     "manim-widget==0.2.0",
-#     "mapwidget==0.2.0",
+#     "mapwidget==0.2.1",
 #     "marimo>=0.23.13",
 #     "matplotlib==3.11.0",
 #     "numpy==2.5.1",
@@ -103,6 +103,9 @@ with app.setup(hide_code=True):
         "assets/jack.png",
         "assets/jar.png",
         "assets/parrot.png",
+        "assets/experimental-setup-simple.excalidraw",
+        "assets/experimental-setup.excalidraw",
+        "assets/llm-intro.excalidraw",
         "data/geo_cities.json",
         "data/geo_monument_examples.json",
         "data/geo_monuments.json",
@@ -1775,7 +1778,7 @@ def digit_probes_puzzle():
 
 @app.cell(hide_code=True)
 def helix_probe_display():
-    HelixProbe(is_3d=True, autoplay=False)
+    HelixProbe(is_3d=True, autoplay=False, js="remote")
     return
 
 
@@ -2050,7 +2053,7 @@ def digit_angle_helix(
             self.camera.background_color = "#1a1a2e"
             self.set_camera_orientation(phi=80 * DEGREES, theta=-75 * DEGREES, zoom=1.8)
 
-    _DigitHelix(_numbers, _cos_all, _sin_all, _z_all, is_3d=True)
+    _DigitHelix(_numbers, _cos_all, _sin_all, _z_all, is_3d=True, js="remote")
     return
 
 
@@ -2434,7 +2437,7 @@ class ManifoldWorld(ManimWidget):
 
 @app.cell
 def manifold_world_display():
-    ManifoldWorld(is_3d=True, autoplay=False, canvas_width=900)
+    ManifoldWorld(is_3d=True, autoplay=False, canvas_width=900. js="remote")
     return
 
 
@@ -2505,7 +2508,7 @@ class ManifoldWorldProjection(ManifoldWorld):
 
 @app.cell
 def _():
-    ManifoldWorldProjection(is_3d=True, autoplay=False, canvas_width=900)
+    ManifoldWorldProjection(is_3d=True, autoplay=False, canvas_width=900, js="remote")
     return
 
 
@@ -3312,7 +3315,8 @@ def belief_geometry_splines_3d(
         (_z_lo, _z_hi),
         is_3d=True,
         canvas_width=900,
-        autoplay=False
+        autoplay=False,
+        js="remote"
     )
     belief_splines_widget
     return
@@ -3473,7 +3477,7 @@ class ManifoldWorldPiecewiseLinear(ManifoldWorld):
 
 @app.cell(hide_code=True)
 def manifold_world_piecewise_display():
-    ManifoldWorldPiecewiseLinear(is_3d=True, autoplay=False, canvas_width=900)
+    ManifoldWorldPiecewiseLinear(is_3d=True, autoplay=False, canvas_width=900, js="remote")
     return
 
 
@@ -3556,7 +3560,7 @@ def multi_category_aside():
 
     We construct a set of probes, one for each $\mu$. The role of each probe is to detect it's assigned mu, and to react to nothing else.
 
-    {mo.as_html(ManifoldWorldMultiCategory(is_3d=True, autoplay=False, canvas_width=900))}
+    {mo.as_html(ManifoldWorldMultiCategory(is_3d=True, autoplay=False, canvas_width=900, js="remote"))}
 
     It's essentially a training trick. You train the probes $W_{{\mu}}$  such that $Softmax(W_{{\mu}} x_0)$ gives you almost one for the $\mu$ associated with $x_0$ and 0 for the other.
 
