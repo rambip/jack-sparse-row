@@ -5019,7 +5019,6 @@ def geo_monument_globe_plot(
     geo_monument_map
     return
 
-
 @app.cell(hide_code=True)
 def additional_material_title():
     mo.md(r"""
@@ -5112,52 +5111,41 @@ def _():
 
 @app.cell(hide_code=True)
 def intrinsic_dimension_pca_chart(intrinsic_dimension_pca_df):
-    _nearest_layer = alt.selection_point(
-        nearest=True,
-        on="pointerover",
-        fields=["layer"],
-        empty=False,
+    _pca_heatmap_df = (
+        intrinsic_dimension_pca_df
+        .sort(["layer", "k"])
+        .to_pandas()
     )
 
-    _base = alt.Chart(intrinsic_dimension_pca_df).encode(
-        x=alt.X(
-            "k:O",
-            title="PCA rank k",
-            axis=alt.Axis(labelAngle=0),
-        ),
-        y=alt.Y(
-            "variance_first_k:Q",
-            title="Cumulative explained variance",
-            scale=alt.Scale(domain=[0, 1]),
-            axis=alt.Axis(format="%"),
-        ),
+    alt.Chart(_pca_heatmap_df).mark_rect().encode(
+        x=alt.X("k:O", title="PCA rank k", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("layer:O", title="Layer"),
         color=alt.Color(
-            "layer:Q",
-            title="Layer",
-            scale=alt.Scale(scheme="turbo"),
+            "variance_axis_k:Q",
+            title="Explained variance",
+            scale=alt.Scale(scheme="greys"),
         ),
-        detail="layer:N",
         tooltip=[
             alt.Tooltip("layer:Q", title="layer", format=".0f"),
             alt.Tooltip("k:Q", title="rank", format=".0f"),
-            alt.Tooltip("variance_axis_k:Q", title="axis variance", format=".1%"),
+            alt.Tooltip("variance_axis_k:Q", title="explained variance", format=".1%"),
             alt.Tooltip("variance_first_k:Q", title="cumulative", format=".1%"),
             alt.Tooltip("variance_after_k:Q", title="remaining", format=".1%"),
             alt.Tooltip("n_centroids:Q", title="centroids", format=".0f"),
         ],
-    )
-
-    _lines = _base.mark_line(point=True, strokeWidth=2.25).encode(
-        opacity=alt.condition(_nearest_layer, alt.value(0.98), alt.value(0.16)),
-    ).add_params(_nearest_layer)
-
-    _hover_targets = _base.mark_point(size=160, opacity=0).add_params(_nearest_layer)
-
-    (_lines + _hover_targets).properties(
+    ).properties(
         width=940,
-        height=380,
-        title="Joint (mu, sigma) centroid PCA intrinsic dimension by layer",
+        height=420,
+        title="Joint (mu, sigma) centroid PCA explained variance by layer",
     )
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    A black cell means all points are aligned. A large gray band means the variance is spread out between many dimensions.
+    """)
     return
 
 
@@ -5424,8 +5412,381 @@ def linear_probe_limits_note():
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
+    mo.md(r"""
+    ## The true shape of belief, steering lies and gradient approximation
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    This question of "what is the true shape of the $(\mu, \sigma)$ space" has driven me mad.
+
+    I tried different visualizations, different kind of probes, non-linear projections ... But I was not able to really understand why going off-manifold in a straight line caused this change.
+
+    Quick answer: we're not going in a straight line.
+
+    I suspected it in the "gradient steering" experiment. If the representation was mainly preserved betweenlayer 15 and the last layer (before the unembedding matrix), that means we could compute the gradient on the last layer instead (which is way easier) and apply it. But that does not work: there is something mysterious, and non-linear, going on in the last layer. Said differently, the "Lens Hypothesis" (The layers have the same representation basis) is clearly invalidated here.
+
+    It would be a new paper alltogether to investigate this fact (probably an **attention head or the *MLP block* doing something weird), but I can at least illustrate why steering does not move in a straight line.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def belief_centroid_spline_vector_field(
+    DEVICE,
+    LAYER,
+    PIRATE_BLUE,
+    PIRATE_GREEN,
+    PIRATE_ORANGE,
+    PIRATE_PURPLE,
+    activation_groups,
+    bundle,
+    experiment_config,
+    group_prompts,
+    piecewise_steering_trace,
+    steered_grad_at_last_pos,
+    straight_steering_trace,
+    tokenize,
+):
+
+    from scipy.interpolate import CubicSpline
+    from matplotlib.lines import Line2D
+
+    mo.stop(
+        not activation_groups,
+        mo.callout(mo.md("No activations - run collection first."), kind="warn"),
+    )
+
+    _plot_layer = LAYER + 1
+    _mu_values = tuple(sorted(experiment_config.mu_values))
+    _sigma_values = tuple(
+        s for s in sorted(experiment_config.sigma_values) if s != 200.0
+    )
+    _group_keys = [(mu, sigma) for sigma in _sigma_values for mu in _mu_values]
+
+
+    def _last_token_reps(prompt):
+        ids = tokenize(bundle, [prompt]).to(DEVICE)
+        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][-1]
+        zero = np.zeros(bundle.model.config.hidden_size, dtype=np.float32)
+        pos, _, _, _ = steered_grad_at_last_pos(
+            bundle, LAYER, _plot_layer, ids, last_pos, steering_vector=zero
+        )
+        return pos, pos
+
+    _layer15_centroids = {}
+    _raw_centroids = {}
+    for _mu in _mu_values:
+        for _sigma in _sigma_values:
+            _prompt = group_prompts(
+                _mu, _sigma, experiment_config.n_numbers, 1, experiment_config.seed
+            )[0]
+            _l15, _l16 = _last_token_reps(_prompt)
+            _layer15_centroids[(_mu, _sigma)] = _l15
+            _raw_centroids[(_mu, _sigma)] = _l16
+
+
+    def _sigma_grad_at_point(prompt, point):
+        ids = tokenize(bundle, [prompt]).to(DEVICE)
+        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][-1]
+        zero = np.zeros(bundle.model.config.hidden_size, dtype=np.float32)
+        _, grad, _, _ = steered_grad_at_last_pos(
+            bundle, LAYER, _plot_layer, ids, last_pos, steering_vector=zero
+        )
+        return grad
+
+    _prompt_cache = {}
+    _raw_gradients = {}
+    for _mu in _mu_values:
+        for _sigma in _sigma_values:
+            _prompt_cache[(_mu, _sigma)] = group_prompts(
+                _mu, _sigma, experiment_config.n_numbers, 1, experiment_config.seed
+            )[0]
+            _raw_gradients[(_mu, _sigma)] = _sigma_grad_at_point(
+                _prompt_cache[(_mu, _sigma)], _raw_centroids[(_mu, _sigma)]
+            )
+
+
+    def _make_projection(source_vectors):
+        basis_matrix = np.stack([source_vectors[key] for key in _group_keys])
+        basis_mean = basis_matrix.mean(axis=0)
+        _, _, vt = np.linalg.svd(basis_matrix - basis_mean, full_matrices=False)
+        pc1, pc2 = vt[0], vt[1]
+
+        def _project_point(v):
+            c = v - basis_mean
+            return np.array([c @ pc1, c @ pc2], dtype=np.float64)
+
+        def _project_vector(v):
+            return np.array([v @ pc1, v @ pc2], dtype=np.float64)
+
+        return _project_point, _project_vector
+
+
+    _project_centroid_point, _project_centroid_vector = _make_projection(_raw_centroids)
+    _project_grad_point, _project_grad_vector = _make_projection(_raw_gradients)
+
+    _projected_centroids_centroid_pca = {
+        _key: _project_centroid_point(_raw_centroids[_key]) for _key in _group_keys
+    }
+    _projected_grads_centroid_pca = {
+        _key: _project_centroid_vector(_raw_gradients[_key]) for _key in _group_keys
+    }
+    _projected_centroids_grad_pca = {
+        _key: _project_grad_point(_raw_centroids[_key]) for _key in _group_keys
+    }
+    _projected_grads_grad_pca = {
+        _key: _project_grad_vector(_raw_gradients[_key]) for _key in _group_keys
+    }
+    _path_points_centroid_pca = np.stack(
+        [_project_centroid_point(_point) for _point in straight_steering_trace["position"]]
+    )
+    _path_grads_centroid_pca = np.stack(
+        [_project_centroid_vector(_grad) for _grad in straight_steering_trace["gradient"]]
+    )
+    _path_points_grad_pca = np.stack(
+        [_project_grad_point(_point) for _point in straight_steering_trace["position"]]
+    )
+    _path_grads_grad_pca = np.stack(
+        [_project_grad_vector(_grad) for _grad in straight_steering_trace["gradient"]]
+    )
+    _piecewise_path_points_centroid_pca = np.stack(
+        [_project_centroid_point(_point) for _point in piecewise_steering_trace["position"]]
+    )
+    _piecewise_path_points_grad_pca = np.stack(
+        [_project_grad_point(_point) for _point in piecewise_steering_trace["position"]]
+    )
+
+    _colors = {
+        _sigma: _color
+        for _sigma, _color in zip(
+            _sigma_values,
+            [PIRATE_BLUE, PIRATE_ORANGE, PIRATE_GREEN, PIRATE_PURPLE],
+        )
+    }
+
+
+    def _draw_panel(ax, projected_centroids, projected_grads, path_points, path_grads, piecewise_path_points, title):
+        t = np.arange(len(_mu_values), dtype=float)
+        for _sigma in _sigma_values:
+            pts = np.stack([projected_centroids[(_mu, _sigma)] for _mu in _mu_values])
+            sx = CubicSpline(t, pts[:, 0], bc_type="natural")
+            sy = CubicSpline(t, pts[:, 1], bc_type="natural")
+            tt = np.linspace(t[0], t[-1], 200)
+            ax.plot(sx(tt), sy(tt), color=_colors[_sigma], linewidth=3.0, alpha=0.9)
+            ax.scatter(
+                pts[:, 0],
+                pts[:, 1],
+                color=_colors[_sigma],
+                s=38,
+                zorder=4,
+                edgecolor="white",
+                linewidth=0.6,
+            )
+
+        path_t = np.linspace(0.0, 1.0, len(path_points))
+        path_sx = CubicSpline(path_t, path_points[:, 0], bc_type="natural")
+        path_sy = CubicSpline(path_t, path_points[:, 1], bc_type="natural")
+        path_tt = np.linspace(path_t[0], path_t[-1], 200)
+        ax.plot(
+            path_sx(path_tt),
+            path_sy(path_tt),
+            color="#808080",
+            linewidth=2.2,
+            alpha=0.95,
+            zorder=6,
+        )
+
+        piecewise_path_t = np.linspace(0.0, 1.0, len(piecewise_path_points))
+        piecewise_path_sx = CubicSpline(
+            piecewise_path_t, piecewise_path_points[:, 0], bc_type="natural"
+        )
+        piecewise_path_sy = CubicSpline(
+            piecewise_path_t, piecewise_path_points[:, 1], bc_type="natural"
+        )
+        piecewise_path_tt = np.linspace(piecewise_path_t[0], piecewise_path_t[-1], 200)
+        ax.plot(
+            piecewise_path_sx(piecewise_path_tt),
+            piecewise_path_sy(piecewise_path_tt),
+            color="#b8b8b8",
+            linewidth=1.8,
+            linestyle=":",
+            alpha=0.95,
+            zorder=5,
+        )
+
+        start_xy = path_points[0]
+        target_xy = projected_centroids[(float(max(_mu_values)), 50.0)]
+        ax.scatter(
+            start_xy[0],
+            start_xy[1],
+            s=70,
+            marker="o",
+            facecolor="white",
+            edgecolor="black",
+            linewidth=1.4,
+            zorder=8,
+        )
+        ax.scatter(
+            target_xy[0],
+            target_xy[1],
+            s=80,
+            marker="s",
+            facecolor="white",
+            edgecolor="black",
+            linewidth=1.4,
+            zorder=8,
+        )
+        ax.text(
+            start_xy[0] + 0.12,
+            start_xy[1],
+            "start",
+            ha="left",
+            va="center",
+            fontsize=10,
+            color="black",
+            zorder=9,
+        )
+        ax.text(
+            target_xy[0] + 0.12,
+            target_xy[1],
+            "target",
+            ha="left",
+            va="center",
+            fontsize=10,
+            color="black",
+            zorder=9,
+        )
+
+        xy = np.stack(list(projected_centroids.values()))
+        dists = np.sqrt((((xy[:, None, :] - xy[None, :, :]) ** 2).sum(axis=-1)))
+        nonzero = dists[dists > 0]
+        arrow_len = 0.17 * (np.median(nonzero) if len(nonzero) else 1.0)
+        mean_grad_norm = (
+            np.mean(
+                [np.linalg.norm(v) for v in list(projected_grads.values()) + list(path_grads)]
+            )
+            + 1e-12
+        )
+        legend_handles = [
+            Line2D([0], [0], color=_colors[_sigma], lw=4.0, label=f"σ={int(_sigma)}")
+            for _sigma in _sigma_values
+        ] + [
+            Line2D([0], [0], color="#808080", lw=2.2, label="Straight steering"),
+            Line2D(
+                [0],
+                [0],
+                color="#b8b8b8",
+                lw=1.8,
+                linestyle=":",
+                label="Piecewise steering",
+            ),
+        ]
+        ax.legend(
+            handles=legend_handles,
+            loc="upper left",
+            frameon=True,
+            framealpha=0.92,
+            fancybox=False,
+            borderpad=0.4,
+            handlelength=2.2,
+            title="Sigma",
+            title_fontsize=10,
+        )
+        for (_mu, _sigma), _p in projected_centroids.items():
+            _g = projected_grads[(_mu, _sigma)]
+            _d = _g * (arrow_len / mean_grad_norm)
+            ax.arrow(
+                _p[0],
+                _p[1],
+                _d[0],
+                _d[1],
+                color=_colors[_sigma],
+                alpha=0.55,
+                width=0.0,
+                head_width=0.035 * arrow_len,
+                length_includes_head=True,
+            )
+
+        for _p, _g in zip(path_points, path_grads):
+            _d = _g * (arrow_len / mean_grad_norm)
+            ax.arrow(
+                _p[0],
+                _p[1],
+                _d[0],
+                _d[1],
+                color="black",
+                alpha=0.85,
+                width=0.0,
+                head_width=0.035 * arrow_len,
+                length_includes_head=True,
+                zorder=7,
+            )
+
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_title(title)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_aspect("equal", adjustable="box")
+
+
+    _fig, (_ax_left, _ax_right) = plt.subplots(
+        1,
+        2,
+        figsize=(15.5, 7.2),
+        constrained_layout=True,
+    )
+    _draw_panel(
+        _ax_left,
+        _projected_centroids_centroid_pca,
+        _projected_grads_centroid_pca,
+        _path_points_centroid_pca,
+        _path_grads_centroid_pca,
+        _piecewise_path_points_centroid_pca,
+        f"PCA on {len(_group_keys)} centroids",
+    )
+    _draw_panel(
+        _ax_right,
+        _projected_centroids_grad_pca,
+        _projected_grads_grad_pca,
+        _path_points_grad_pca,
+        _path_grads_grad_pca,
+        _piecewise_path_points_grad_pca,
+        f"PCA on {len(_group_keys)} gradients",
+    )
+    plt.close(_fig)
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    On this figure, you can see the 3 sigma paths, but this time in a different space: **directly from the last layer**.
+    Let's be precise about what is going on:
+    - we're intercepting the activations at layer 15 and 16
+    - we're computing the steering direction in this space
+    - we're applying the steering
+    - we compute the resulting position (post-steering) at layer 16
+
+    And then we're plotting everything on layer 16. We're also adding the directions of increasing sigma as arrows, using the gradient.
+
+    The plot on the left use a basis derived from the PCA of the points (more honnest about the "true" position in the space), the plot on the right uses the PCA of the gradients instead (more honnest about the real gradient direction and magnitude at each point).
+
+    For me, these 2 plots give the full story. Here is my interpretation:
+    - The "sigma" gradient vector field is very curvy indeed in the region we're interested in. Worse, it varies faster in some regions than in other.
+    - the "straight" direction we chose was not orthogonal to the gradient. So obviously, it increased from the start. In comparison, the piecewise linear path (dotted path) deviated less from the target path.
+    - both the straight and piecewise steering techniques produce a non-straight path on layer 16, i.e the layer applies a strong non-linearity.
+    - For some reason, the straight steering produces a path that looks straight in the 2d PCA given by the gradients ‽‽‽
+    - As we discussed earlier, the steering works less as we move into previous layers. That seems to indicate that the non-linearity accumulates rapidly with layers.
+
+    As often with research, more questions than answers ! But that's the interesting thing right ?
+    """)
     return
 
 
