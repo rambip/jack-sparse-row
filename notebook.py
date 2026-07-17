@@ -4,11 +4,9 @@
 #     "altair==6.2.2",
 #     "anywidget==0.11.0",
 #     "folium==0.20.0",
-#     "ipyleaflet==0.20.0",
 #     "leafmap==0.63.0",
 #     "manim==0.20.1",
-#     "manim-widget==0.2.0",
-#     "mapwidget==0.2.1",
+#     "manim-widget==0.2.1",
 #     "marimo>=0.23.13",
 #     "matplotlib==3.11.0",
 #     "numpy==2.5.1",
@@ -20,11 +18,9 @@
 #     "torch==2.12.1",
 #     "traitlets==5.15.1",
 #     "transformers==5.13.0",
-#     "wigglystuff==0.5.11",
+#     "wigglystuff==0.5.20",
 # ]
 #
-# [tool.uv.sources]
-# wigglystuff = { git = "https://github.com/koaning/wigglystuff/" }
 # ///
 
 import marimo
