@@ -25,7 +25,7 @@
 
 import marimo
 
-__generated_with = "0.23.14"
+__generated_with = "0.25.2"
 app = marimo.App(
     width="medium",
     css_file="/usr/local/_marimo/custom.css",
@@ -105,6 +105,7 @@ with app.setup(hide_code=True):
         "data/geo_cities.json",
         "data/geo_monument_examples.json",
         "data/geo_monuments.json",
+        "custom.css",
     )
 
     def ensure_repo_assets_and_data(root="."):
@@ -126,299 +127,246 @@ with app.setup(hide_code=True):
         mo.status.toast(f"Downloaded {len(_downloaded_repo_files)} missing asset/data files")
 
 
-@app.cell(hide_code=True)
-def widgets():
-    class CSSInjector(anywidget.AnyWidget):
-        _esm = """
-        function injectCSS(vars, styles, root) {
-            const varText = Object.entries(vars).map(([k,v]) => `${k}: ${v} !important`).join('; ');
-            const styleText = Object.entries(styles).map(([k,v]) => `${k}:${v}`).join(';');
-            const id = 'pirate-css-override';
+@app.class_definition(hide_code=True)
+class Ticker(anywidget.AnyWidget):
+    """A custom widget with play/stop/restart buttons that animates through steps."""
 
-            if (root instanceof ShadowRoot) {
-                let tag = root.querySelector('#' + id);
-                if (!tag) { tag = document.createElement('style'); tag.id = id; root.appendChild(tag); }
-                tag.textContent = `:host { ${varText} } * { ${varText} } .markdown { ${styleText} }`;
-            }
+    current_step = traitlets.Int(0).tag(sync=True)
+    ticks = traitlets.List([]).tag(sync=True)
+    label_start = traitlets.Unicode("Play").tag(sync=True)
+    label_stop = traitlets.Unicode("Stop").tag(sync=True)
+    label_restart = traitlets.Unicode("Restart").tag(sync=True)
 
-            for (const el of (root.querySelectorAll ? root.querySelectorAll('*') : [])) {
-                if (el.shadowRoot) injectCSS(vars, styles, el.shadowRoot);
-            }
-        }
+    def __init__(self, ticks, label_start="Play", label_stop="Stop", label_restart="Restart", **kwargs):
+        super().__init__(**kwargs)
+        self.ticks = ticks
+        self.label_start = label_start
+        self.label_stop = label_stop
+        self.label_restart = label_restart
 
-        function render({ model, el }) {
-            const vars = model.get('vars');
-            const styles = model.get('styles');
-
-            const globalId = 'pirate-global-styles';
-            let globalStyle = document.getElementById(globalId);
-            if (!globalStyle) {
-                globalStyle = document.createElement('style');
-                globalStyle.id = globalId;
-                document.head.appendChild(globalStyle);
-            }
-            const varText = Object.entries(vars).map(([k,v]) => `${k}: ${v} !important`).join('; ');
-            const styleText = Object.entries(styles).map(([k,v]) => `${k}:${v}`).join(';');
-            const fontImport = styles['font-family']
-                ? `@import url('https://fonts.googleapis.com/css2?family=Crimson+Text:ital@0;1&display=swap');`
-                : '';
-            globalStyle.textContent = fontImport + ` :root { ${varText} } .markdown { ${styleText} }`;
-
-            injectCSS(vars, styles, document);
-            const observer = new MutationObserver(() => injectCSS(vars, styles, document));
-            observer.observe(document.body, { childList: true, subtree: true });
-
-            el.textContent = 'CSS injected';
-            return () => observer.disconnect();
-        }
-        export default { render };
-        """
-        vars = traitlets.Dict({}).tag(sync=True)
-        styles = traitlets.Dict({}).tag(sync=True)
-
-
-    class Ticker(anywidget.AnyWidget):
-        """A custom widget with play/stop/restart buttons that animates through steps."""
-
-        current_step = traitlets.Int(0).tag(sync=True)
-        ticks = traitlets.List([]).tag(sync=True)
-        label_start = traitlets.Unicode("Play").tag(sync=True)
-        label_stop = traitlets.Unicode("Stop").tag(sync=True)
-        label_restart = traitlets.Unicode("Restart").tag(sync=True)
-
-        def __init__(self, ticks, label_start="Play", label_stop="Stop", label_restart="Restart", **kwargs):
-            super().__init__(**kwargs)
-            self.ticks = ticks
-            self.label_start = label_start
-            self.label_stop = label_stop
-            self.label_restart = label_restart
-
-        _esm = """
-        function render({ model, el }) {
-            el.innerHTML = `
-            <div class="animator-box">
-                <div class="button-row">
-                    <button class="animator-btn main-btn"></button>
-                    <button class="animator-btn restart-btn" style="display: none;">↻ Restart</button>
-                </div>
-                <div class="progress-row">
-                    <div class="animator-track">
-                        <div class="animator-fill"></div>
-                    </div>
-                    <div class="animator-text">0/0</div>
-                </div>
+    _esm = """
+    function render({ model, el }) {
+        el.innerHTML = `
+        <div class="animator-box">
+            <div class="button-row">
+                <button class="animator-btn main-btn"></button>
+                <button class="animator-btn restart-btn" style="display: none;">↻ Restart</button>
             </div>
-            `;
+            <div class="progress-row">
+                <div class="animator-track">
+                    <div class="animator-fill"></div>
+                </div>
+                <div class="animator-text">0/0</div>
+            </div>
+        </div>
+        `;
 
-            const mainBtn = el.querySelector('.main-btn');
-            const restartBtn = el.querySelector('.restart-btn');
-            const text = el.querySelector('.animator-text');
-            const fill = el.querySelector('.animator-fill');
+        const mainBtn = el.querySelector('.main-btn');
+        const restartBtn = el.querySelector('.restart-btn');
+        const text = el.querySelector('.animator-text');
+        const fill = el.querySelector('.animator-fill');
 
-            let playing = false;
-            let timer = null;
+        let playing = false;
+        let timer = null;
 
-            function getLabel(labelType) {
-                const label = model.get(labelType);
-                if (labelType === 'label_start') return label || 'Play';
-                if (labelType === 'label_stop') return label || 'Stop';
-                if (labelType === 'label_restart') return label || 'Restart';
-                return label || '';
+        function getLabel(labelType) {
+            const label = model.get(labelType);
+            if (labelType === 'label_start') return label || 'Play';
+            if (labelType === 'label_stop') return label || 'Stop';
+            if (labelType === 'label_restart') return label || 'Restart';
+            return label || '';
+        }
+
+        function updateButtons() {
+            const step = model.get('current_step');
+            const ticks = model.get('ticks') || [];
+            const total = ticks.length;
+            const isComplete = step >= total && total > 0;
+
+            if (isComplete && !playing) {
+                // Animation complete - show restart button
+                mainBtn.style.display = 'none';
+                restartBtn.style.display = 'block';
+            } else {
+                // Animation in progress or not started
+                mainBtn.style.display = 'block';
+                restartBtn.style.display = 'none';
+                mainBtn.textContent = playing ? ('⏹ ' + getLabel('label_stop')) : ('▶ ' + getLabel('label_start'));
+                mainBtn.classList.toggle('stop', playing);
             }
+        }
 
-            function updateButtons() {
-                const step = model.get('current_step');
-                const ticks = model.get('ticks') || [];
-                const total = ticks.length;
-                const isComplete = step >= total && total > 0;
+        function update() {
+            const step = model.get('current_step');
+            const ticks = model.get('ticks') || [];
+            const total = ticks.length;
+            const pct = total > 0 ? (step / total) * 100 : 0;
 
-                if (isComplete && !playing) {
-                    // Animation complete - show restart button
-                    mainBtn.style.display = 'none';
-                    restartBtn.style.display = 'block';
-                } else {
-                    // Animation in progress or not started
-                    mainBtn.style.display = 'block';
-                    restartBtn.style.display = 'none';
-                    mainBtn.textContent = playing ? ('⏹ ' + getLabel('label_stop')) : ('▶ ' + getLabel('label_start'));
-                    mainBtn.classList.toggle('stop', playing);
-                }
-            }
+            fill.style.width = pct + '%';
+            text.textContent = `${step}/${total}`;
+            updateButtons();
+        }
 
-            function update() {
-                const step = model.get('current_step');
-                const ticks = model.get('ticks') || [];
-                const total = ticks.length;
-                const pct = total > 0 ? (step / total) * 100 : 0;
+        function tick() {
+            const ticks = model.get('ticks') || [];
+            const total = ticks.length;
+            let step = model.get('current_step');
 
-                fill.style.width = pct + '%';
-                text.textContent = `${step}/${total}`;
-                updateButtons();
-            }
-
-            function tick() {
-                const ticks = model.get('ticks') || [];
-                const total = ticks.length;
-                let step = model.get('current_step');
-
-                if (!playing || step >= total) {
-                    playing = false;
-                    updateButtons();
-                    return;
-                }
-
-                // next step
-                step = step + 1;
-                model.set('current_step', step);
-                model.save_changes();
-                update();
-
-                // schedule next
-                if (step < total) {
-                    timer = setTimeout(tick, ticks[step - 1] || 500);
-                } else {
-                    playing = false;
-                    updateButtons();
-                }
-            }
-
-            function startAnimation() {
-                const total = (model.get('ticks') || []).length;
-                if (model.get('current_step') >= total) {
-                    model.set('current_step', 0);
-                    model.save_changes();
-                    update();
-                }
-                playing = true;
-                updateButtons();
-                tick();
-            }
-
-            function stopAnimation() {
+            if (!playing || step >= total) {
                 playing = false;
-                clearTimeout(timer);
                 updateButtons();
+                return;
             }
 
-            function restartAnimation() {
+            // next step
+            step = step + 1;
+            model.set('current_step', step);
+            model.save_changes();
+            update();
+
+            // schedule next
+            if (step < total) {
+                timer = setTimeout(tick, ticks[step - 1] || 500);
+            } else {
+                playing = false;
+                updateButtons();
+            }
+        }
+
+        function startAnimation() {
+            const total = (model.get('ticks') || []).length;
+            if (model.get('current_step') >= total) {
                 model.set('current_step', 0);
                 model.save_changes();
                 update();
+            }
+            playing = true;
+            updateButtons();
+            tick();
+        }
+
+        function stopAnimation() {
+            playing = false;
+            clearTimeout(timer);
+            updateButtons();
+        }
+
+        function restartAnimation() {
+            model.set('current_step', 0);
+            model.save_changes();
+            update();
+            startAnimation();
+        }
+
+        // Main button click handler (play/stop)
+        mainBtn.onclick = () => {
+            if (playing) {
+                stopAnimation();
+            } else {
                 startAnimation();
             }
+        };
 
-            // Main button click handler (play/stop)
-            mainBtn.onclick = () => {
-                if (playing) {
-                    stopAnimation();
-                } else {
-                    startAnimation();
-                }
-            };
+        // Restart button click handler
+        restartBtn.onclick = () => {
+            restartAnimation();
+        };
 
-            // Restart button click handler
-            restartBtn.onclick = () => {
-                restartAnimation();
-            };
+        model.on('change:current_step', update);
+        model.on('change:ticks', update);
+        model.on('change:label_start', update);
+        model.on('change:label_stop', update);
+        model.on('change:label_restart', update);
+        update();
 
-            model.on('change:current_step', update);
-            model.on('change:ticks', update);
-            model.on('change:label_start', update);
-            model.on('change:label_stop', update);
-            model.on('change:label_restart', update);
-            update();
+        return () => {
+            playing = false;
+            clearTimeout(timer);
+        };
+    }
 
-            return () => {
-                playing = false;
-                clearTimeout(timer);
-            };
-        }
+    export default { render };
+    """
 
-        export default { render };
-        """
+    _css = """
+    .animator-box {
+        font-family: system-ui, sans-serif;
+        padding: 16px;
+        background: #f5f5f5;
+        border-radius: 8px;
+        width: 400px;
+    }
 
-        _css = """
-        .animator-box {
-            font-family: system-ui, sans-serif;
-            padding: 16px;
-            background: #f5f5f5;
-            border-radius: 8px;
-            width: 400px;
-        }
+    .button-row {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+        margin-bottom: 16px;
+    }
 
-        .button-row {
-            display: flex;
-            justify-content: center;
-            gap: 8px;
-            margin-bottom: 16px;
-        }
+    .animator-btn {
+        padding: 6px 12px;
+        font-size: 13px;
+        font-weight: 600;
+        color: white;
+        background: #5C8020;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
 
-        .animator-btn {
-            padding: 6px 12px;
-            font-size: 13px;
-            font-weight: 600;
-            color: white;
-            background: #5C8020;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
+    .animator-btn:hover {
+        transform: translateY(-1px);
+    }
 
-        .animator-btn:hover {
-            transform: translateY(-1px);
-        }
+    .animator-btn.stop {
+        background: #E87F24;
+    }
 
-        .animator-btn.stop {
-            background: #E87F24;
-        }
+    .restart-btn {
+        background: #5C8020;
+        min-width: 80px;
+    }
 
-        .restart-btn {
-            background: #5C8020;
-            min-width: 80px;
-        }
+    .restart-btn:hover {
+        background: var(--grass-9);
+    }
 
-        .restart-btn:hover {
-            background: var(--grass-9);
-        }
+    .progress-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
 
-        .progress-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
+    .animator-text {
+        font-size: 13px;
+        color: #555;
+        white-space: nowrap;
+        min-width: 50px;
+        text-align: right;
+    }
 
-        .animator-text {
-            font-size: 13px;
-            color: #555;
-            white-space: nowrap;
-            min-width: 50px;
-            text-align: right;
-        }
+    .animator-track {
+        flex: 1;
+        height: 6px;
+        background: #ddd;
+        border-radius: 3px;
+        overflow: hidden;
+    }
 
-        .animator-track {
-            flex: 1;
-            height: 6px;
-            background: #ddd;
-            border-radius: 3px;
-            overflow: hidden;
-        }
-
-        .animator-fill {
-            height: 100%;
-            width: 0%;
-            background: #5C8020;
-            border-radius: 3px;
-            transition: width 0.2s ease;
-        }
-        """
-
-
-    return CSSInjector, Ticker
+    .animator-fill {
+        height: 100%;
+        width: 0%;
+        background: #5C8020;
+        border-radius: 3px;
+        transition: width 0.2s ease;
+    }
+    """
 
 
 @app.cell(hide_code=True)
-def images_and_theme(CSSInjector):
+def images_and_theme():
     def jack(size=150, float=True):
         style = "float:left; margin-right:15px; margin-bottom:10px;" if float else ""
         return mo.Html(f'<div style="{style}">{mo.image("assets/jack.png", width=size).text}</div>')
@@ -448,25 +396,9 @@ def images_and_theme(CSSInjector):
     PIRATE_RED = "#a8071f"
 
 
-    _css = CSSInjector(
-        vars={
-            "--red-2": "#FFD5C0",
-            "--red-8": PIRATE_ORANGE,
-            "--red-9": PIRATE_ORANGE,
-            "--grass-2": "#EFF6D0",
-            "--grass-8": PIRATE_GREEN,
-            "--grass-9": PIRATE_GREEN,
-            "--blue-2": "#C8DFF0",
-            "--blue-8": PIRATE_BLUE,
-            "--blue-9": PIRATE_BLUE,
-            "--blue-10": "#5A8FB5",
-        },
-        styles={
-            "font-family": "'Crimson Text', serif",
-            "font-size": "20px",
-        },
-    )
-    _css
+    # Theme lives in custom.css (next to the notebook). molab ignores css_file and
+    # custom_css, so we inject it as a global <style> output instead.
+    mo.Html(f"<style>{(mo.notebook_dir() / 'custom.css').read_text()}</style>")
     return (
         PIRATE_BLUE,
         PIRATE_GREEN,
@@ -1094,7 +1026,6 @@ def ticker(
     N_POINTS,
     SLOW_STEPS,
     SLOW_TICK,
-    Ticker,
     probe_animation_precomputed,
 ):
     ticks = [SLOW_TICK] * SLOW_STEPS + [FAST_TICK] * (N_POINTS - SLOW_STEPS)
@@ -4007,7 +3938,6 @@ def steering_variant_data(
         }
 
     straight_steering_trace = _collect_straight_steering_trace()
-
     return (
         chord_steering_df,
         piecewise_steering_df,
@@ -6194,3 +6124,4 @@ def _(N_POINTS):
 
 if __name__ == "__main__":
     app.run()
+

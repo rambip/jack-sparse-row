@@ -1,0 +1,23 @@
+/* Pirate theme.
+   Injected by the `images_and_theme` cell as a <style> output, because molab
+   overrides App(css_file=...) and ignores [tool.marimo.display] custom_css. */
+
+@import url('https://fonts.googleapis.com/css2?family=Crimson+Text:ital@0;1&display=swap');
+
+:root, .light, .dark {
+  --red-2: #FFD5C0 !important;
+  --red-8: #E87F24 !important;    /* PIRATE_ORANGE */
+  --red-9: #E87F24 !important;
+  --grass-2: #EFF6D0 !important;
+  --grass-8: #5C8020 !important;  /* PIRATE_GREEN */
+  --grass-9: #5C8020 !important;
+  --blue-2: #C8DFF0 !important;
+  --blue-8: #73A5CA !important;   /* PIRATE_BLUE */
+  --blue-9: #73A5CA !important;
+  --blue-10: #5A8FB5 !important;
+}
+
+.markdown {
+  font-family: 'Crimson Text', serif;
+  font-size: 20px;
+}
