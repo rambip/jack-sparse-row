@@ -557,16 +557,11 @@ def model_selector():
 
 
 @app.cell(hide_code=True)
-def jack_demo_bundle(bundle):
-    jack_bundle = bundle
-    return (jack_bundle,)
-
-
-@app.cell(hide_code=True)
 def jack_demo_helpers(
     SUPPORT,
+    get_model,
     ints_to_prompt,
-    jack_bundle,
+    model_name,
     sample_gaussian_ints,
     scan_batch,
     tokenize,
@@ -574,11 +569,12 @@ def jack_demo_helpers(
     @mo.persistent_cache
     def convergence_soft(mu: float, sigma: float, n: int, seed: int) -> np.ndarray:
         """Real softmax over the 1000 integer tokens at every comma position of one
-        Gaussian sequence, from the fixed demo model (jack_bundle)."""
+        Gaussian sequence, from the selected model."""
+        bundle = get_model(model_name)
         rng = np.random.default_rng(seed)
         xs = sample_gaussian_ints(mu, sigma, n, rng)
-        ids = tokenize(jack_bundle, [ints_to_prompt(xs)])
-        _, soft = scan_batch(jack_bundle, ids)
+        ids = tokenize(bundle, [ints_to_prompt(xs)])
+        _, soft = scan_batch(bundle, ids)
         return soft[0]
 
 
@@ -586,13 +582,14 @@ def jack_demo_helpers(
     def switch_soft(mu_before: float, mu_after: float, sigma: float, n_each: int, seed: int) -> np.ndarray:
         """Same as convergence_soft, but the generating mean switches from mu_before
         to mu_after halfway through the sequence."""
+        bundle = get_model(model_name)
         rng = np.random.default_rng(seed)
         xs = np.concatenate([
             sample_gaussian_ints(mu_before, sigma, n_each, rng),
             sample_gaussian_ints(mu_after, sigma, n_each, rng),
         ])
-        ids = tokenize(jack_bundle, [ints_to_prompt(xs)])
-        _, soft = scan_batch(jack_bundle, ids)
+        ids = tokenize(bundle, [ints_to_prompt(xs)])
+        _, soft = scan_batch(bundle, ids)
         return soft[0]
 
 
@@ -1392,13 +1389,43 @@ def collect_imports():
             .numpy()
         )
 
+
+    from functools import lru_cache
+
+
+    @lru_cache(maxsize=1)
+    def get_model(model_name: str) -> ModelBundle:
+        """Model singleton, called only inside persistent-cached functions, so it
+        loads on the first cache miss and is reused afterwards. maxsize=1 drops the
+        previous model when model_selector changes."""
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Cache miss: this result is not in the cache and needs {model_name}, "
+                "but no GPU is available."
+            )
+        with mo.status.progress_bar(total=1, title=f"Loading {model_name}") as _bar:
+            _bundle = load_model(model_name)
+            _bar.update()
+        return _bundle
+
+
+    @lru_cache(maxsize=None)
+    def get_config(model_name: str):
+        """Model metadata (layers, hidden size) without downloading weights."""
+        from transformers import AutoConfig
+
+        return AutoConfig.from_pretrained(model_name)
+
+
     return (
         DEVICE,
         SUPPORT,
+        get_config,
+        get_model,
         gpu_batch_size,
         group_prompts,
         ints_to_prompt,
-        load_model,
+        lru_cache,
         sample_gaussian_ints,
         scan_batch,
         steered_scan_batch,
@@ -1407,26 +1434,14 @@ def collect_imports():
 
 
 @app.cell(hide_code=True)
-def model_bundle(load_model, model_selector):
-    mo.stop(
-        not torch.cuda.is_available(),
-        mo.callout(
-            mo.md("No GPU available — model loading skipped."), kind="warn"
-        ),
-    )
-    with mo.status.progress_bar(total=1, title="Loading model") as _bar:
-        bundle = load_model(model_selector.value)
-        _bar.update()
-    return (bundle,)
+def model_bundle(get_config, model_selector):
+    model_name = model_selector.value
+    model_config = get_config(model_name)
+    return model_config, model_name
 
 
 @app.cell(hide_code=True)
-def simple_embeddings(DEVICE, bundle, tokenize):
-    mo.stop(
-        not torch.cuda.is_available(),
-        mo.callout(mo.md("No GPU available — embedding skipped."), kind="warn"),
-    )
-
+def simple_embeddings(DEVICE, get_model, lru_cache, tokenize):
     TEMPLATES = [
         "I think {}",
         "The number {}",
@@ -1437,46 +1452,61 @@ def simple_embeddings(DEVICE, bundle, tokenize):
         "Count: {}",
         "Value {}",
     ]
+    SIMPLE_NUMBERS = range(100, 1000)
 
-    @torch.inference_mode()
-    def _embed_number_templates(n: int) -> np.ndarray:
-        """Per-template activations, not averaged. Returns [templates, layers, d]."""
-        acts = []
-        for template in TEMPLATES:
-            prompt = template.format(n)
-            ids = tokenize(bundle, [prompt]).to(DEVICE)
-            n_digit_toks = len(bundle.tokenizer.encode(str(n), add_special_tokens=False))
-            out = bundle.model(input_ids=ids, output_hidden_states=True)
-            hidden = torch.stack(out.hidden_states, dim=1)[0]
-            acts.append(hidden[:, -n_digit_toks:, :].mean(dim=1).float().cpu().numpy())
-        return np.stack(acts)  # [templates, layers, d]
+    @lru_cache(maxsize=1)
+    def _embed_all_layers(model_name: str) -> dict[int, np.ndarray]:
+        """One forward pass per (number, template) prompt, keeping every layer:
+        {n: [templates, layers, d]}. Held in memory only, so the first cache miss
+        pays for the pass and the other layers are sliced from it for free."""
+        bundle = get_model(model_name)
 
-    with mo.persistent_cache("simple_embeddings_templates", save_path="./checkpoints/cache"):
-        simple_embeddings_templates = {
-            n: _embed_number_templates(n)
-            for n in mo.status.progress_bar(range(100, 1000), title="Embedding numbers (per template)")
+        @torch.inference_mode()
+        def _embed(n: int) -> np.ndarray:
+            acts = []
+            for template in TEMPLATES:
+                ids = tokenize(bundle, [template.format(n)]).to(DEVICE)
+                n_digit_toks = len(bundle.tokenizer.encode(str(n), add_special_tokens=False))
+                out = bundle.model(input_ids=ids, output_hidden_states=True)
+                hidden = torch.stack(out.hidden_states, dim=1)[0]
+                acts.append(hidden[:, -n_digit_toks:, :].mean(dim=1).float().cpu().numpy())
+            return np.stack(acts)
+
+        return {
+            n: _embed(n)
+            for n in mo.status.progress_bar(SIMPLE_NUMBERS, title="Embedding numbers (per template)")
         }
 
-    simple_embeddings = {n: v.mean(axis=0) for n, v in simple_embeddings_templates.items()}
-    return TEMPLATES, simple_embeddings_templates
+    @mo.persistent_cache
+    def simple_embeddings_at_layer(model_name: str, layer: int) -> dict[int, np.ndarray]:
+        """Per-template activations of each number at one layer: {n: [templates, d]}."""
+        return {n: v[:, layer].copy() for n, v in _embed_all_layers(model_name).items()}
+
+
+    return TEMPLATES, simple_embeddings_at_layer
+
+
+@app.cell
+def simple_layer_embeddings(
+    model_name,
+    simple_embeddings_at_layer,
+    simple_layer_slider,
+):
+    simple_layer_embeddings = simple_embeddings_at_layer(model_name, simple_layer_slider.value)
+    return (simple_layer_embeddings,)
 
 
 @app.cell(hide_code=True)
 def collect_activations(
-    bundle,
     experiment_config,
+    get_model,
     gpu_batch_size,
     ints_to_prompt,
+    model_name,
     sample_gaussian_ints,
     scan_batch,
     tokenize,
 ):
-    mo.stop(
-        not torch.cuda.is_available(),
-        mo.callout(
-            mo.md("No GPU available — collection skipped."), kind="warn"
-        ),
-    )
 
     _collection_batch_size = gpu_batch_size(8)
 
@@ -1484,6 +1514,7 @@ def collect_activations(
         mu: float, sigma: float
     ) -> tuple[np.ndarray, np.ndarray]:
         """Collect converged-mean residuals and softmax for one (mu, sigma) pair."""
+        bundle = get_model(model_name)
         rng = np.random.default_rng(experiment_config.seed)
         prompts = [
             ints_to_prompt(
@@ -1541,26 +1572,26 @@ def simple_probe_intro():
 
 
 @app.cell(hide_code=True)
-def simple_layer_slider(bundle):
-    simple_layer_slider = mo.ui.slider(0, bundle.n_layers, value=12, label="Layer", debounce=True, show_value=True)
+def simple_layer_slider(model_config):
+    simple_layer_slider = mo.ui.slider(0, model_config.num_hidden_layers, value=12, label="Layer", debounce=True, show_value=True)
     simple_layer_slider
     return (simple_layer_slider,)
 
 
 @app.function(hide_code=True)
-def build_flat_split(embeddings_templates, layer, test_size=0.2, seed=42, n_templates_train=3):
-    """Flatten per-template activations at a layer.
+def build_flat_split(embeddings, test_size=0.2, seed=42, n_templates_train=3):
+    """Flatten per-template activations ({n: [templates, d]}, one layer).
 
     Train keeps a random sample of `n_templates_train` templates per number
     (multiple rows/number); test keeps exactly one random template per number.
     """
-    numbers = np.array(sorted(embeddings_templates.keys()))
+    numbers = np.array(sorted(embeddings.keys()))
     train_numbers, test_numbers = train_test_split(numbers, test_size=test_size, random_state=seed)
     rng = np.random.default_rng(seed)
-    n_t = next(iter(embeddings_templates.values())).shape[0]
+    n_t = next(iter(embeddings.values())).shape[0]
 
     train_rows = [
-        (n, t, embeddings_templates[n][t, layer])
+        (n, t, embeddings[n][t])
         for n in train_numbers
         for t in rng.choice(n_t, size=min(n_templates_train, n_t), replace=False)
     ]
@@ -1571,7 +1602,7 @@ def build_flat_split(embeddings_templates, layer, test_size=0.2, seed=42, n_temp
     test_template_idx = {n: int(rng.integers(n_t)) for n in test_numbers}
     numbers_test = test_numbers
     template_idx_test = np.array([test_template_idx[n] for n in test_numbers])
-    X_test = np.stack([embeddings_templates[n][test_template_idx[n], layer] for n in test_numbers])
+    X_test = np.stack([embeddings[n][test_template_idx[n]] for n in test_numbers])
 
     return numbers_train, template_idx_train, X_train, numbers_test, template_idx_test, X_test
 
@@ -1581,16 +1612,11 @@ def simple_probe_scatter(
     PIRATE_BLUE,
     PIRATE_ORANGE,
     TEMPLATES,
-    simple_embeddings_templates,
+    simple_layer_embeddings,
     simple_layer_slider,
 ):
-    mo.stop(
-        not simple_embeddings_templates,
-        mo.callout(mo.md("No embeddings — run simple embedding first."), kind="warn"),
-    )
-
     _layer = simple_layer_slider.value
-    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_embeddings_templates, _layer)
+    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_layer_embeddings)
 
     _y_tr = _n_tr.astype(np.float64)
     _y_te = _n_te.astype(np.float64)
@@ -1646,16 +1672,11 @@ def simple_probe_scatter_note():
 def ends_with_7_probe(
     PIRATE_BLUE,
     PIRATE_ORANGE,
-    simple_embeddings_templates,
+    simple_layer_embeddings,
     simple_layer_slider,
 ):
-    mo.stop(
-        not simple_embeddings_templates,
-        mo.callout(mo.md("No embeddings — run simple embedding first."), kind="warn"),
-    )
-
     _layer = simple_layer_slider.value
-    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_embeddings_templates, _layer)
+    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_layer_embeddings)
 
     _y_tr = (_n_tr % 10 == 7).astype(int)
     _y_te = (_n_te % 10 == 7).astype(int)
@@ -1719,16 +1740,11 @@ def helix_basis_note():
 @app.cell(hide_code=True)
 def digit_angle_probes(
     TEMPLATES,
-    simple_embeddings_templates,
+    simple_layer_embeddings,
     simple_layer_slider,
 ):
-    mo.stop(
-        not simple_embeddings_templates,
-        mo.callout(mo.md("No embeddings — run simple embedding first."), kind="warn"),
-    )
-
     _layer = simple_layer_slider.value
-    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_embeddings_templates, _layer)
+    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_layer_embeddings)
 
     _angles_tr = 2 * np.pi * (_n_tr % 10) / 10
     _cos_tr = np.cos(_angles_tr)
@@ -1911,21 +1927,16 @@ def digit_angle_helix(
     helix_template_dropdown,
     probe_cos_digit,
     probe_sin_digit,
-    simple_embeddings_templates,
+    simple_layer_embeddings,
     simple_layer_slider,
 ):
-    mo.stop(
-        not simple_embeddings_templates,
-        mo.callout(mo.md("No embeddings — run simple embedding first."), kind="warn"),
-    )
-
     _layer = simple_layer_slider.value
     _TEMPLATE = helix_template_dropdown.value
     _numbers = np.array(range(100, 150))
 
     _template_idx = TEMPLATES.index(_TEMPLATE)
     _X_all = np.stack([
-        simple_embeddings_templates[n][_template_idx, _layer] for n in _numbers
+        simple_layer_embeddings[n][_template_idx] for n in _numbers
     ]).astype(np.float64)
     _cos_all = probe_cos_digit.predict(_X_all)
     _sin_all = probe_sin_digit.predict(_X_all)
@@ -2003,20 +2014,15 @@ def curvy_numbers_note():
 def parity_probe(
     PIRATE_GREEN,
     PIRATE_RED,
-    simple_embeddings_templates,
+    simple_layer_embeddings,
     simple_layer_slider,
 ):
-    mo.stop(
-        not simple_embeddings_templates,
-        mo.callout(mo.md("No embeddings — run simple embedding first."), kind="warn"),
-    )
-
     def _digit_sum_parity(n):
         _d = (n // 100) + (n // 10) % 10 + n % 10
         return _d % 2
 
     _layer = simple_layer_slider.value
-    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_embeddings_templates, _layer)
+    _n_tr, _t_tr, _X_tr, _n_te, _t_te, _X_te = build_flat_split(simple_layer_embeddings)
 
     _y_tr = np.array([_digit_sum_parity(n) for n in _n_tr])
     _y_te = np.array([_digit_sum_parity(n) for n in _n_te])
@@ -2507,9 +2513,10 @@ def steering_helpers(
     PIRATE_ORANGE,
     PIRATE_PURPLE,
     SUPPORT,
-    bundle,
+    get_model,
     gpu_batch_size,
     group_prompts,
+    model_name,
     pooled_mean,
     pooled_mean_by_sigma,
     steered_scan_batch,
@@ -2564,6 +2571,7 @@ def steering_helpers(
         """Real softmax mean/std for (mu, sigma) prompts after adding alpha*direction to the
         residual stream at `layer` via a forward hook — the model is actually re-run end to end,
         no synthetic probe readout involved."""
+        bundle = get_model(model_name)
         prompts = group_prompts(mu, sigma, n_numbers, n_sequences, seed)
         vector = alpha * np.array(direction)
         values = np.arange(SUPPORT)
@@ -3711,11 +3719,12 @@ def steering_variant_helpers(
 def steering_variant_data(
     DEVICE,
     activation_groups,
-    bundle,
     chord_direction_at,
     collect_variable_direction_steering_curve,
     experiment_config,
+    get_model,
     group_prompts,
+    model_name,
     piecewise_direction_at,
     pooled_centroids,
     spline_direction_at,
@@ -3763,6 +3772,7 @@ def steering_variant_data(
 
     @mo.persistent_cache
     def _collect_spline_steering_trace():
+        bundle = get_model(model_name)
         path_sigma = 50.0
         prompt = group_prompts(
             steer_mu,
@@ -3823,6 +3833,7 @@ def steering_variant_data(
 
     @mo.persistent_cache
     def _collect_piecewise_steering_trace():
+        bundle = get_model(model_name)
         path_sigma = 50.0
         prompt = group_prompts(
             steer_mu,
@@ -3882,6 +3893,7 @@ def steering_variant_data(
 
     @mo.persistent_cache
     def _collect_straight_steering_trace():
+        bundle = get_model(model_name)
         path_sigma = 50.0
         prompt = group_prompts(
             steer_mu,
@@ -4222,8 +4234,9 @@ def gradient_illustration(PIRATE_BLUE, PIRATE_ORANGE):
 def gradient_steering_helpers(
     DEVICE,
     SUPPORT,
-    bundle,
+    get_model,
     group_prompts,
+    model_name,
     tokenize,
 ):
     def exact_grad_at_last_pos(bundle, layer, ids, last_pos, base_vector=None):
@@ -4352,6 +4365,7 @@ def gradient_steering_helpers(
         )
 
 
+    @mo.persistent_cache
     def gradient_discovery_trajectory(
         layer,
         mu,
@@ -4373,6 +4387,7 @@ def gradient_steering_helpers(
         so a shared total_alpha silently under-steers the resistant groups. Returns
         the walk's own measured (alpha, pred_mu, pred_sigma) at each step -- a single
         real sweep, not a separate re-verification. max_segments is a safety cap."""
+        bundle = get_model(model_name)
         prompts = group_prompts(mu, sigma, n_numbers, 1, seed)
         ids = tokenize(bundle, prompts).to(DEVICE)
         last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][
@@ -4731,9 +4746,10 @@ def geo_jitter_training_data(
 @app.cell(hide_code=True)
 def geo_collect_activations(
     DEVICE,
-    bundle,
     geo_train_button,
     geo_training_prompts,
+    get_model,
+    model_name,
 ):
     mo.stop(
         not geo_train_button.value,
@@ -4747,6 +4763,7 @@ def geo_collect_activations(
 
     @mo.persistent_cache
     def geo_collect_geo_activations(prompts):
+        bundle = get_model(model_name)
         @torch.inference_mode()
         def _last_token_resid(prompt):
             ids = bundle.tokenizer(prompt, return_tensors="pt").input_ids.to(
@@ -4852,7 +4869,6 @@ def geo_belief_helpers(
     EARTH_RADIUS_KM,
     GEO_QUERY_TEMPLATES,
     PIRATE_ORANGE,
-    bundle,
     geo_best_layer,
     geo_city_classifier_full,
     geo_city_scaler,
@@ -4862,14 +4878,18 @@ def geo_belief_helpers(
     geo_latlon_to_xyz,
     geo_names,
     geo_xyz_to_latlon,
+    get_model,
+    model_name,
 ):
-    @torch.inference_mode()
+    @mo.persistent_cache
     def geo_activation_at_layer(prompt, layer):
-        ids = bundle.tokenizer(prompt, return_tensors="pt").input_ids.to(
-            DEVICE
-        )
-        out = bundle.model(input_ids=ids, output_hidden_states=True)
-        return out.hidden_states[layer][0, -1, :].float().cpu().numpy()
+        bundle = get_model(model_name)
+        with torch.inference_mode():
+            ids = bundle.tokenizer(prompt, return_tensors="pt").input_ids.to(
+                DEVICE
+            )
+            out = bundle.model(input_ids=ids, output_hidden_states=True)
+            return out.hidden_states[layer][0, -1, :].float().cpu().numpy()
 
     def geo_belief_from_prompt(
         prompt, layer=None, classifier=None, scaler=None
@@ -5635,9 +5655,10 @@ def belief_centroid_spline_vector_field(
     PIRATE_ORANGE,
     PIRATE_PURPLE,
     activation_groups,
-    bundle,
     experiment_config,
+    get_model,
     group_prompts,
+    model_name,
     piecewise_steering_trace,
     steered_grad_at_last_pos,
     straight_steering_trace,
@@ -5660,46 +5681,37 @@ def belief_centroid_spline_vector_field(
     _group_keys = [(mu, sigma) for sigma in _sigma_values for mu in _mu_values]
 
 
-    def _last_token_reps(prompt):
-        ids = tokenize(bundle, [prompt]).to(DEVICE)
-        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][-1]
-        zero = np.zeros(bundle.model.config.hidden_size, dtype=np.float32)
-        pos, _, _, _ = steered_grad_at_last_pos(
-            bundle, LAYER, _plot_layer, ids, last_pos, steering_vector=zero
-        )
-        return pos, pos
-
-    _layer15_centroids = {}
-    _raw_centroids = {}
-    for _mu in _mu_values:
-        for _sigma in _sigma_values:
-            _prompt = group_prompts(
-                _mu, _sigma, experiment_config.n_numbers, 1, experiment_config.seed
-            )[0]
-            _l15, _l16 = _last_token_reps(_prompt)
-            _layer15_centroids[(_mu, _sigma)] = _l15
-            _raw_centroids[(_mu, _sigma)] = _l16
-
-
-    def _sigma_grad_at_point(prompt, point):
-        ids = tokenize(bundle, [prompt]).to(DEVICE)
-        last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][-1]
-        zero = np.zeros(bundle.model.config.hidden_size, dtype=np.float32)
-        _, grad, _, _ = steered_grad_at_last_pos(
-            bundle, LAYER, _plot_layer, ids, last_pos, steering_vector=zero
-        )
-        return grad
-
-    _prompt_cache = {}
-    _raw_gradients = {}
-    for _mu in _mu_values:
-        for _sigma in _sigma_values:
-            _prompt_cache[(_mu, _sigma)] = group_prompts(
-                _mu, _sigma, experiment_config.n_numbers, 1, experiment_config.seed
-            )[0]
-            _raw_gradients[(_mu, _sigma)] = _sigma_grad_at_point(
-                _prompt_cache[(_mu, _sigma)], _raw_centroids[(_mu, _sigma)]
+    @mo.persistent_cache
+    def _reps_and_sigma_grads(prompts: tuple[str, ...], steer_layer: int, plot_layer: int):
+        """One unsteered forward+backward per prompt: (last-position rep, sigma gradient)."""
+        bundle = get_model(model_name)
+        results = []
+        for prompt in prompts:
+            ids = tokenize(bundle, [prompt]).to(DEVICE)
+            last_pos = (ids[0] == bundle.comma_token_id).nonzero(as_tuple=True)[0][-1]
+            zero = np.zeros(bundle.model.config.hidden_size, dtype=np.float32)
+            pos, grad, _, _ = steered_grad_at_last_pos(
+                bundle, steer_layer, plot_layer, ids, last_pos, steering_vector=zero
             )
+            results.append((pos, grad))
+        return results
+
+    _prompt_cache = {
+        (_mu, _sigma): group_prompts(
+            _mu, _sigma, experiment_config.n_numbers, 1, experiment_config.seed
+        )[0]
+        for _mu in _mu_values
+        for _sigma in _sigma_values
+    }
+    _reps = dict(
+        zip(
+            _prompt_cache,
+            _reps_and_sigma_grads(tuple(_prompt_cache.values()), LAYER, _plot_layer),
+        )
+    )
+    _layer15_centroids = {_k: _pos for _k, (_pos, _) in _reps.items()}
+    _raw_centroids = dict(_layer15_centroids)
+    _raw_gradients = {_k: _grad for _k, (_, _grad) in _reps.items()}
 
 
     def _make_projection(source_vectors):
@@ -6124,4 +6136,3 @@ def _(N_POINTS):
 
 if __name__ == "__main__":
     app.run()
-
